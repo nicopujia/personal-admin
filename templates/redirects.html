@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% set active_page = "redirects" %}
+
+{% block title %}Redirects - Pujia Admin{% endblock %}
+{% block heading %}Redirects{% endblock %}
+
+{% block content %}
+  {% include "_redirects_content.html" %}
+{% endblock %}
+
+{% block scripts %}
+  <script src="{{ url_for('static', filename='redirects.js') }}" defer></script>
+{% endblock %}

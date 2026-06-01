@@ -1,0 +1,101 @@
+<div id="redirects-content">
+  <div id="redirects-messages" class="messages" aria-live="polite"></div>
+
+  <div class="stats">
+    <span>{{ enabled_count }} active</span>
+    <span>{{ rules|length }} rules</span>
+    <span>{{ path_count }} paths</span>
+  </div>
+
+  <section class="panel">
+    <form class="create-grid" method="post" action="{{ url_for('create_redirect') }}" data-async="redirects" data-create-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>
+        <span>Paths</span>
+        <textarea name="source_paths" placeholder="/x&#10;/twitter" autocomplete="off" required></textarea>
+      </label>
+      <label>
+        <span>Target URL</span>
+        <input name="target_url" placeholder="example.com" inputmode="url" required>
+      </label>
+      <label>
+        <span>Status</span>
+        <select name="status_code">
+          {% for code in status_codes %}
+            <option value="{{ code }}" {% if code == 302 %}selected{% endif %}>{{ code }} - {{ status_labels[code] }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="check">
+        <input name="enabled" type="checkbox" checked>
+        <span>Enabled</span>
+      </label>
+      <label class="check">
+        <input name="preserve_query" type="checkbox">
+        <span title="Append the visitor's ?query=value parameters to the target URL.">Keep query params</span>
+      </label>
+      <button type="submit">Add</button>
+    </form>
+  </section>
+
+  <section class="table-wrap" aria-label="Redirect links">
+    {% if rules %}
+      <div class="redirect-table">
+        <div class="table-head">
+          <span>Paths</span>
+          <span>Target</span>
+          <span>Status</span>
+          <span>Options</span>
+          <span></span>
+        </div>
+        {% for rule in rules %}
+          <form class="table-row" method="post" action="{{ url_for('update_redirect', rule_id=rule.id) }}" data-async="redirects">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>
+              <span class="mobile-label">Paths</span>
+              <textarea name="source_paths" required>{{ rule.source_paths_text }}</textarea>
+            </label>
+            <label>
+              <span class="mobile-label">Target</span>
+              <input name="target_url" value="{{ rule.target_url }}" inputmode="url" required>
+            </label>
+            <label>
+              <span class="mobile-label">Status</span>
+              <select name="status_code">
+                {% for code in status_codes %}
+                  <option value="{{ code }}" {% if code == rule.status_code %}selected{% endif %}>{{ code }} - {{ status_labels[code] }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <div class="checks">
+              <label class="check">
+                <input name="enabled" type="checkbox" {% if rule.enabled %}checked{% endif %}>
+                <span>Enabled</span>
+              </label>
+              <label class="check">
+                <input name="preserve_query" type="checkbox" {% if rule.preserve_query %}checked{% endif %}>
+                <span title="Append the visitor's ?query=value parameters to the target URL.">Keep query params</span>
+              </label>
+            </div>
+            <div class="actions">
+              <a href="{{ public_base_url }}{{ rule.primary_source_path }}" target="_blank" rel="noreferrer">Open</a>
+              <button type="submit">Save</button>
+              <button
+                class="danger"
+                type="submit"
+                form="delete-{{ rule.id }}"
+              >Delete</button>
+            </div>
+          </form>
+          <form id="delete-{{ rule.id }}" method="post" action="{{ url_for('delete_redirect', rule_id=rule.id) }}" data-async="redirects">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          </form>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty">
+        <p>No redirects yet.</p>
+      </div>
+    {% endif %}
+  </section>
+</div>

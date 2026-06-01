@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Pujia Admin{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">admin.pujia.ar</p>
+          <h1>{% block heading %}Admin{% endblock %}</h1>
+        </div>
+        <nav class="nav" aria-label="Admin sections">
+          <a href="{{ url_for('dashboard') }}" {% if active_page == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
+          <a href="{{ url_for('redirects_page') }}" {% if active_page == "redirects" %}aria-current="page"{% endif %}>Redirects</a>
+        </nav>
+      </header>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="messages" aria-live="polite">
+            {% for category, message in messages %}
+              <p class="message {{ category }}">{{ message }}</p>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      {% block content %}{% endblock %}
+    </main>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

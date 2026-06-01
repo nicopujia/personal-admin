@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+app_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+env_file="${1:-$app_dir/.env}"
+
+if [ ! -f "$env_file" ]; then
+  echo "Missing env file: $env_file" >&2
+  exit 1
+fi
+
+set -a
+. "$env_file"
+set +a
+
+: "${ADMIN_BASIC_AUTH_USERS:?ADMIN_BASIC_AUTH_USERS is required}"
+: "${ADMIN_BASIC_AUTH_PASSWORD:?ADMIN_BASIC_AUTH_PASSWORD is required}"
+: "${ADMIN_BASIC_AUTH_HTPASSWD_PATH:?ADMIN_BASIC_AUTH_HTPASSWD_PATH is required}"
+
+target="$ADMIN_BASIC_AUTH_HTPASSWD_PATH"
+case "$target" in
+  /*) ;;
+  *) target="$app_dir/$target" ;;
+esac
+target_dir="$(dirname "$target")"
+tmp_file="$(mktemp "$target_dir/.admin.htpasswd.XXXXXX")"
+
+cleanup() {
+  rm -f "$tmp_file"
+}
+trap cleanup EXIT INT TERM
+
+printf '%s\n' "$ADMIN_BASIC_AUTH_USERS" | tr ',' '\n' | while IFS= read -r user; do
+  user="$(printf '%s' "$user" | tr -d '[:space:]')"
+  if [ -z "$user" ]; then
+    continue
+  fi
+
+  hash="$(openssl passwd -apr1 "$ADMIN_BASIC_AUTH_PASSWORD")"
+  printf '%s:%s\n' "$user" "$hash" >> "$tmp_file"
+done
+
+if [ ! -s "$tmp_file" ]; then
+  echo "No Basic Auth users were written." >&2
+  exit 1
+fi
+
+chmod 0644 "$tmp_file"
+mv "$tmp_file" "$target"
+trap - EXIT INT TERM
