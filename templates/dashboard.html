@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 
-{% set active_page = "dashboard" %}
+{% set breadcrumb_items = [
+  {"label": "Dashboard", "current": true}
+] %}
 
-{% block title %}Pujia Admin{% endblock %}
-{% block heading %}Admin{% endblock %}
+{% block title %}Dashboard - {{ admin_title }}{% endblock %}
 
 {% block content %}
   <section class="feature-list" aria-label="Admin features">

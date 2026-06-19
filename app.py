@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import fcntl
-import json
 import os
 import secrets
-import tempfile
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,22 +10,20 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from dotenv import load_dotenv
 from flask import (
     Flask,
     abort,
     flash,
-    jsonify,
     redirect,
     render_template,
     request,
     session,
     url_for,
 )
+from waitress import serve
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_PATH = BASE_DIR / "data" / "redirects.json"
-PUBLIC_REDIRECT_HEADER = "X-Pujia-Redirect-Request"
-PUBLIC_REDIRECT_HEADER_VALUE = "1"
 STATUS_CODES = (301, 302, 307, 308)
 STATUS_LABELS = {
     301: "Permanent",
@@ -57,141 +53,214 @@ class RedirectRule:
         return "\n".join(self.source_paths)
 
 
+def env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+
+    value = value.strip()
+    return value or None
+
+
+def required_env(name: str) -> str:
+    value = env(name)
+    if value is None:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def resolve_path(raw_path: str | Path) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+
+load_dotenv(dotenv_path=BASE_DIR / ".env", override=False)
+
+TITLE = required_env("TITLE")
+BASE_URL = required_env("BASE_URL").rstrip("/")
+REDIRECT_HEADER = required_env("REDIRECT_HEADER")
+REDIRECT_HEADER_VALUE = required_env("REDIRECT_HEADER_VALUE")
+
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("ADMIN_SECRET_KEY", secrets.token_hex(32))
+app.secret_key = required_env("SECRET_KEY")
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
 
-def data_path() -> Path:
-    path = Path(os.environ.get("ADMIN_DATA_PATH", DEFAULT_DATA_PATH)).expanduser()
-    if not path.is_absolute():
-        path = BASE_DIR / path
-    return path
-
-
-def lock_path() -> Path:
-    path = data_path()
-    return path.with_suffix(path.suffix + ".lock")
+def database_path() -> Path:
+    return resolve_path(required_env("DATABASE_PATH"))
 
 
 @contextmanager
-def data_lock() -> Any:
-    path = lock_path()
+def connect_db() -> Any:
+    path = database_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    ensure_schema(connection)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def ensure_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS redirects (
+            id TEXT PRIMARY KEY,
+            target_url TEXT NOT NULL,
+            status_code INTEGER NOT NULL CHECK (status_code IN (301, 302, 307, 308)),
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            preserve_query INTEGER NOT NULL CHECK (preserve_query IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS redirect_paths (
+            redirect_id TEXT NOT NULL REFERENCES redirects(id) ON DELETE CASCADE,
+            source_path TEXT NOT NULL UNIQUE,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            PRIMARY KEY (redirect_id, source_path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_redirect_paths_redirect_position
+            ON redirect_paths (redirect_id, position);
+        """
+    )
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def empty_store() -> dict[str, Any]:
-    return {"redirects": []}
+def hydrate_rules(rows: list[sqlite3.Row]) -> list[RedirectRule]:
+    grouped: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        rule_id = str(row["id"])
+        rule = grouped.setdefault(
+            rule_id,
+            {
+                "id": rule_id,
+                "source_paths": [],
+                "target_url": str(row["target_url"]),
+                "status_code": int(row["status_code"]),
+                "enabled": bool(row["enabled"]),
+                "preserve_query": bool(row["preserve_query"]),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            },
+        )
+        rule["source_paths"].append(str(row["source_path"]))
+
+    return [RedirectRule(**rule) for rule in grouped.values()]
 
 
-def read_store() -> dict[str, Any]:
-    path = data_path()
-    if not path.exists():
-        return empty_store()
-
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return empty_store()
-
-    if not isinstance(raw, dict) or not isinstance(raw.get("redirects"), list):
-        return empty_store()
-
-    return raw
-
-
-def write_store(store: dict[str, Any]) -> None:
-    path = data_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=path.parent,
-        delete=False,
-    ) as temp_file:
-        json.dump(store, temp_file, indent=2, sort_keys=True)
-        temp_file.write("\n")
-        temp_name = temp_file.name
-
-    Path(temp_name).replace(path)
+def fetch_rules(
+    connection: sqlite3.Connection,
+    where_clause: str = "",
+    params: tuple[Any, ...] = (),
+) -> list[RedirectRule]:
+    where = f" WHERE {where_clause}" if where_clause else ""
+    rows = connection.execute(
+        f"""
+        SELECT
+            r.id,
+            r.target_url,
+            r.status_code,
+            r.enabled,
+            r.preserve_query,
+            r.created_at,
+            r.updated_at,
+            p.source_path,
+            p.position
+        FROM redirects r
+        JOIN redirect_paths p ON p.redirect_id = r.id
+        {where}
+        ORDER BY r.id, p.position
+        """,
+        params,
+    ).fetchall()
+    return hydrate_rules(rows)
 
 
-def load_rules() -> list[RedirectRule]:
-    return [coerce_rule(item) for item in read_store()["redirects"]]
+def list_rules() -> list[RedirectRule]:
+    with connect_db() as connection:
+        return fetch_rules(connection)
 
 
-def coerce_rule(item: Any) -> RedirectRule:
-    if not isinstance(item, dict):
-        item = {}
-
-    created_at = str(item.get("created_at") or now_iso())
-    updated_at = str(item.get("updated_at") or created_at)
-
-    return RedirectRule(
-        id=str(item.get("id") or secrets.token_urlsafe(12)),
-        source_paths=coerce_stored_source_paths(item),
-        target_url=str(item.get("target_url") or ""),
-        status_code=int(item.get("status_code") or 302),
-        enabled=bool(item.get("enabled", True)),
-        preserve_query=bool(item.get("preserve_query", False)),
-        created_at=created_at,
-        updated_at=updated_at,
+def insert_rule(connection: sqlite3.Connection, rule: RedirectRule) -> None:
+    connection.execute(
+        """
+        INSERT INTO redirects (
+            id,
+            target_url,
+            status_code,
+            enabled,
+            preserve_query,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            rule.id,
+            rule.target_url,
+            rule.status_code,
+            int(rule.enabled),
+            int(rule.preserve_query),
+            rule.created_at,
+            rule.updated_at,
+        ),
+    )
+    connection.executemany(
+        """
+        INSERT INTO redirect_paths (redirect_id, source_path, position)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (rule.id, source_path, position)
+            for position, source_path in enumerate(rule.source_paths)
+        ],
     )
 
 
-def serialize_rule(rule: RedirectRule) -> dict[str, Any]:
-    return {
-        "id": rule.id,
-        "source_paths": rule.source_paths,
-        "target_url": rule.target_url,
-        "status_code": rule.status_code,
-        "enabled": rule.enabled,
-        "preserve_query": rule.preserve_query,
-        "created_at": rule.created_at,
-        "updated_at": rule.updated_at,
-    }
+def delete_rule(connection: sqlite3.Connection, rule_id: str) -> bool:
+    return (
+        connection.execute("DELETE FROM redirects WHERE id = ?", (rule_id,)).rowcount
+        > 0
+    )
 
 
-def coerce_stored_source_paths(item: dict[str, Any]) -> list[str]:
-    raw_paths = item.get("source_paths")
-    candidates: list[str] = []
-
-    if isinstance(raw_paths, list):
-        candidates.extend(str(path) for path in raw_paths)
-    elif isinstance(raw_paths, str):
-        candidates.append(raw_paths)
-
-    legacy_path = item.get("source_path")
-    if legacy_path:
-        candidates.append(str(legacy_path))
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        try:
-            path = normalize_source_path(candidate)
-        except ValueError:
-            continue
-        if path in seen:
-            continue
-        normalized.append(path)
-        seen.add(path)
-
-    return normalized or ["/"]
+def find_duplicate_path(
+    connection: sqlite3.Connection,
+    source_paths: list[str],
+    exclude_rule_id: str | None = None,
+) -> str | None:
+    placeholders = ", ".join("?" for _ in source_paths)
+    params: list[str] = list(source_paths)
+    exclusion = ""
+    if exclude_rule_id is not None:
+        exclusion = " AND redirect_id != ?"
+        params.append(exclude_rule_id)
+    row = connection.execute(
+        f"""
+        SELECT source_path
+        FROM redirect_paths
+        WHERE source_path IN ({placeholders}){exclusion}
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    return str(row["source_path"]) if row else None
 
 
 def normalize_source_path(value: str) -> str:
@@ -217,24 +286,14 @@ def normalize_source_path(value: str) -> str:
 
 
 def normalize_source_paths(value: str) -> list[str]:
-    paths: list[str] = []
-    seen: set[str] = set()
-
-    for raw_path in value.replace(",", "\n").splitlines():
-        raw_path = raw_path.strip()
-        if not raw_path:
-            continue
-
-        path = normalize_source_path(raw_path)
-        if path in seen:
-            continue
-
-        paths.append(path)
-        seen.add(path)
-
+    paths = [
+        normalize_source_path(raw_path)
+        for raw_path in value.replace(",", "\n").splitlines()
+        if raw_path.strip()
+    ]
+    paths = list(dict.fromkeys(paths))
     if not paths:
         raise ValueError("At least one source path is required.")
-
     return paths
 
 
@@ -266,171 +325,181 @@ def parse_status_code(value: str) -> int:
     return status_code
 
 
+def configured_host() -> str:
+    return required_env("HOST")
+
+
+def configured_port() -> int:
+    return int(required_env("PORT"))
+
+
 def csrf_token() -> str:
-    token = session.get("csrf_token")
-    if not token:
-        token = secrets.token_urlsafe(32)
-        session["csrf_token"] = token
-    return str(token)
+    return str(session.setdefault("csrf_token", secrets.token_urlsafe(32)))
 
 
 @app.context_processor
 def inject_csrf() -> dict[str, Any]:
-    return {"csrf_token": csrf_token}
+    return {
+        "admin_title": TITLE,
+        "csrf_token": csrf_token,
+    }
 
 
 def require_csrf() -> None:
     expected = session.get("csrf_token")
     received = request.form.get("csrf_token")
-    if not expected or not received or not secrets.compare_digest(str(expected), received):
-        abort(400, "Invalid CSRF token.")
+    if expected and received and secrets.compare_digest(str(expected), received):
+        return
+    abort(400, "Invalid CSRF token.")
 
 
-def redirects_context() -> dict[str, Any]:
-    rules = sorted(load_rules(), key=lambda rule: rule.primary_source_path)
-    enabled_count = sum(1 for rule in rules if rule.enabled)
-    path_count = sum(len(rule.source_paths) for rule in rules)
-
+def summarize_rules(rules: list[RedirectRule]) -> dict[str, int]:
     return {
-        "rules": rules,
-        "enabled_count": enabled_count,
-        "path_count": path_count,
-        "status_codes": STATUS_CODES,
-        "status_labels": STATUS_LABELS,
-        "public_base_url": "https://pujia.ar",
+        "enabled_count": sum(rule.enabled for rule in rules),
+        "path_count": sum(len(rule.source_paths) for rule in rules),
     }
 
+def build_rule(*, rule_id: str, created_at: str, updated_at: str) -> RedirectRule:
+    def field(name: str, default: str = "") -> str:
+        return request.form.get(name, default)
 
-def is_async_redirects_request() -> bool:
-    return request.headers.get("X-Pujia-Async") == "redirects"
+    return RedirectRule(
+        id=rule_id,
+        source_paths=normalize_source_paths(field("source_paths")),
+        target_url=normalize_target_url(field("target_url")),
+        status_code=parse_status_code(field("status_code", "302")),
+        enabled=field("enabled") == "on",
+        preserve_query=field("preserve_query") == "on",
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
-def redirects_result(message: str, category: str = "success", status: int = 200) -> Any:
-    if is_async_redirects_request():
-        return (
-            jsonify(
-                {
-                    "ok": category != "error",
-                    "category": category,
-                    "message": message,
-                    "html": render_template("_redirects_content.html", **redirects_context()),
-                }
-            ),
-            status,
-        )
+def update_rule(connection: sqlite3.Connection, rule: RedirectRule) -> None:
+    connection.execute(
+        """
+        UPDATE redirects
+        SET target_url = ?,
+            status_code = ?,
+            enabled = ?,
+            preserve_query = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            rule.target_url,
+            rule.status_code,
+            int(rule.enabled),
+            int(rule.preserve_query),
+            rule.updated_at,
+            rule.id,
+        ),
+    )
+    connection.execute("DELETE FROM redirect_paths WHERE redirect_id = ?", (rule.id,))
+    connection.executemany(
+        """
+        INSERT INTO redirect_paths (redirect_id, source_path, position)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (rule.id, source_path, position)
+            for position, source_path in enumerate(rule.source_paths)
+        ],
+    )
 
+
+def redirects_redirect(message: str, category: str = "success") -> Any:
     flash(message, category)
     return redirect(url_for("redirects_page"))
 
 
 @app.get("/")
 def dashboard() -> str:
-    rules = load_rules()
-    enabled_count = sum(1 for rule in rules if rule.enabled)
-    path_count = sum(len(rule.source_paths) for rule in rules)
-
+    rules = list_rules()
     return render_template(
         "dashboard.html",
-        enabled_count=enabled_count,
-        path_count=path_count,
-        redirect_count=len(rules),
+        **summarize_rules(rules),
     )
 
 
 @app.get("/redirects")
 def redirects_page() -> str:
-    return render_template("redirects.html", **redirects_context())
+    rules = sorted(list_rules(), key=lambda rule: rule.primary_source_path)
+    return render_template(
+        "redirects.html",
+        rules=rules,
+        **summarize_rules(rules),
+        status_codes=STATUS_CODES,
+        status_labels=STATUS_LABELS,
+        base_url=BASE_URL,
+    )
 
 
 @app.post("/redirects")
 def create_redirect() -> Any:
     require_csrf()
+
     try:
-        source_paths_raw = request.form.get("source_paths") or request.form.get("source_path", "")
-        new_rule = RedirectRule(
-            id=secrets.token_urlsafe(12),
-            source_paths=normalize_source_paths(source_paths_raw),
-            target_url=normalize_target_url(request.form.get("target_url", "")),
-            status_code=parse_status_code(request.form.get("status_code", "302")),
-            enabled=request.form.get("enabled") == "on",
-            preserve_query=request.form.get("preserve_query") == "on",
-            created_at=now_iso(),
-            updated_at=now_iso(),
+        timestamp = now_iso()
+        new_rule = build_rule(
+            rule_id=secrets.token_urlsafe(12),
+            created_at=timestamp,
+            updated_at=timestamp,
         )
     except ValueError as exc:
-        return redirects_result(str(exc), "error", 400)
+        return redirects_redirect(str(exc), "error")
 
-    with data_lock():
-        rules = load_rules()
-        duplicate_path = find_duplicate_path(rules, new_rule.source_paths)
-        if duplicate_path:
-            return redirects_result(f"{duplicate_path} already exists.", "error", 400)
+    with connect_db() as connection:
+        with connection:
+            duplicate_path = find_duplicate_path(connection, new_rule.source_paths)
+            if duplicate_path:
+                return redirects_redirect(f"{duplicate_path} already exists.", "error")
 
-        write_store({"redirects": [serialize_rule(rule) for rule in [*rules, new_rule]]})
+            insert_rule(connection, new_rule)
 
-    return redirects_result(f"Added {new_rule.primary_source_path}.")
+    return redirects_redirect(f"Added {new_rule.primary_source_path}.")
 
 
 @app.post("/redirects/<rule_id>")
 def update_redirect(rule_id: str) -> Any:
     require_csrf()
-    try:
-        source_paths_raw = request.form.get("source_paths") or request.form.get("source_path", "")
-        source_paths = normalize_source_paths(source_paths_raw)
-        target_url = normalize_target_url(request.form.get("target_url", ""))
-        status_code = parse_status_code(request.form.get("status_code", "302"))
-        enabled = request.form.get("enabled") == "on"
-        preserve_query = request.form.get("preserve_query") == "on"
-    except ValueError as exc:
-        return redirects_result(str(exc), "error", 400)
 
-    with data_lock():
-        rules = load_rules()
-        duplicate_path = find_duplicate_path(rules, source_paths, exclude_rule_id=rule_id)
-        if duplicate_path:
-            return redirects_result(f"{duplicate_path} already exists.", "error", 400)
+    action = (request.form.get("action") or "save").strip()
+    with connect_db() as connection:
+        existing_rules = fetch_rules(connection, "r.id = ?", (rule_id,))
+        if not existing_rules:
+            return redirects_redirect("Redirect not found.", "error")
+        existing_rule = existing_rules[0]
 
-        updated_rules: list[RedirectRule] = []
-        changed = False
-        for rule in rules:
-            if rule.id != rule_id:
-                updated_rules.append(rule)
-                continue
+        if action == "delete":
+            with connection:
+                delete_rule(connection, rule_id)
+            return redirects_redirect(f"Deleted {existing_rule.primary_source_path}.")
 
-            updated_rules.append(
-                RedirectRule(
-                    id=rule.id,
-                    source_paths=source_paths,
-                    target_url=target_url,
-                    status_code=status_code,
-                    enabled=enabled,
-                    preserve_query=preserve_query,
-                    created_at=rule.created_at,
-                    updated_at=now_iso(),
-                )
+        if action != "save":
+            return redirects_redirect("Unknown redirects action.", "error")
+
+        try:
+            updated_rule = build_rule(
+                rule_id=rule_id,
+                created_at=existing_rule.created_at,
+                updated_at=now_iso(),
             )
-            changed = True
+        except ValueError as exc:
+            return redirects_redirect(str(exc), "error")
 
-        if not changed:
-            return redirects_result("Redirect not found.", "error", 404)
+        duplicate_path = find_duplicate_path(
+            connection,
+            updated_rule.source_paths,
+            exclude_rule_id=rule_id,
+        )
+        if duplicate_path:
+            return redirects_redirect(f"{duplicate_path} already exists.", "error")
 
-        write_store({"redirects": [serialize_rule(rule) for rule in updated_rules]})
+        with connection:
+            update_rule(connection, updated_rule)
 
-    return redirects_result(f"Saved {source_paths[0]}.")
-
-
-@app.post("/redirects/<rule_id>/delete")
-def delete_redirect(rule_id: str) -> Any:
-    require_csrf()
-    with data_lock():
-        rules = load_rules()
-        kept_rules = [rule for rule in rules if rule.id != rule_id]
-        if len(kept_rules) == len(rules):
-            return redirects_result("Redirect not found.", "error", 404)
-
-        write_store({"redirects": [serialize_rule(rule) for rule in kept_rules]})
-
-    return redirects_result("Deleted redirect.")
+    return redirects_redirect(f"Saved {updated_rule.primary_source_path}.")
 
 
 @app.get("/healthz")
@@ -440,14 +509,14 @@ def healthz() -> dict[str, str]:
 
 @app.before_request
 def resolve_public_proxy_requests() -> Any:
-    if request.headers.get(PUBLIC_REDIRECT_HEADER) == PUBLIC_REDIRECT_HEADER_VALUE:
+    if request.headers.get(REDIRECT_HEADER) == REDIRECT_HEADER_VALUE:
         return resolve_public_redirect_path(request.path)
     return None
 
 
 @app.get("/<path:source_path>")
 def public_redirect(source_path: str) -> Any:
-    if request.headers.get(PUBLIC_REDIRECT_HEADER) != PUBLIC_REDIRECT_HEADER_VALUE:
+    if request.headers.get(REDIRECT_HEADER) != REDIRECT_HEADER_VALUE:
         abort(404)
 
     return resolve_public_redirect_path(f"/{source_path}")
@@ -459,12 +528,26 @@ def resolve_public_redirect_path(path: str) -> Any:
     except ValueError:
         abort(404)
 
-    for rule in load_rules():
-        if rule.enabled and requested_path in rule.source_paths:
-            target_url = append_query(rule.target_url, request.query_string.decode("utf-8")) if rule.preserve_query else rule.target_url
-            return redirect(target_url, code=rule.status_code)
+    with connect_db() as connection:
+        row = connection.execute(
+            """
+            SELECT target_url, status_code, preserve_query
+            FROM redirects
+            JOIN redirect_paths ON redirect_paths.redirect_id = redirects.id
+            WHERE enabled = 1 AND source_path = ?
+            LIMIT 1
+            """,
+            (requested_path,),
+        ).fetchone()
 
-    abort(404)
+    if row is None:
+        abort(404)
+
+    target_url = str(row["target_url"])
+    if bool(row["preserve_query"]):
+        target_url = append_query(target_url, request.query_string.decode("utf-8"))
+
+    return redirect(target_url, code=int(row["status_code"]))
 
 
 def append_query(target_url: str, query_string: str) -> str:
@@ -475,27 +558,17 @@ def append_query(target_url: str, query_string: str) -> str:
     return f"{target_url}{separator}{query_string}"
 
 
-def find_duplicate_path(
-    rules: list[RedirectRule],
-    source_paths: list[str],
-    exclude_rule_id: str | None = None,
-) -> str | None:
-    for rule in rules:
-        if rule.id == exclude_rule_id:
-            continue
-        for source_path in source_paths:
-            if source_path in rule.source_paths:
-                return source_path
-    return None
+def start() -> None:
+    serve(app, host=configured_host(), port=configured_port())
 
 
-def main() -> None:
+def dev() -> None:
     app.run(
-        host=os.environ.get("HOST", "127.0.0.1"),
-        port=int(os.environ.get("PORT", "8043")),
-        debug=os.environ.get("FLASK_DEBUG", "0") == "1",
+        host=configured_host(),
+        port=configured_port(),
+        debug=True,
     )
 
 
 if __name__ == "__main__":
-    main()
+    dev()

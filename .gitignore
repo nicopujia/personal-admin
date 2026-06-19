@@ -1,11 +1,9 @@
-.venv/
+data/
+data.sqlite3*
 __pycache__/
+.venv/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-data/*.json
-data/*.lock
-data/*.htpasswd
-!.gitkeep
 .env
