@@ -6,9 +6,9 @@ Minimal personal admin dashboard for random stuff.
 
 ### Features
 
-- Redirections.
+- Redirects.
 
-## Prerrequisites
+## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/)
 
@@ -26,16 +26,18 @@ uv sync --all-groups
 # Format, lint, and typecheck
 uv run ruff format .
 uv run ruff check --fix .
-uv run basedpyright
+uv run python -m basedpyright
 
-# Run development server
-# This runs Flask's development server with HOST and PORT, always with 
-# debug mode enabled.
+# Run the Django development server on HOST:PORT.
+# This bootstraps migrations, collects admin static assets,
+# and ensures the configured admin user exists.
 uv run dev
 
-# Run production server
-# This runs the app behind Waitress on the same HOST and PORT.
-# How you expose, supervise, or proxy that process is
-# intentionally left outside this repo.
+# Run the production server behind Waitress on HOST:PORT.
+# This also runs migrations, collects admin static assets,
+# and ensures the configured admin user exists before serving traffic.
 uv run start
+
+# Run the test suite
+uv run python manage.py test
 ```
