@@ -17,4 +17,11 @@ class NoteAdminTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 302)
-        self.assertEqual(cast(Any, Note).objects.get().text, "Buy milk")
+        note = cast(Any, Note).objects.get()
+        self.assertEqual(note.title, "")
+        self.assertEqual(note.text, "Buy milk")
+
+    def test_title_labels_note(self) -> None:
+        note = Note(title="Shopping", text="Buy milk")
+
+        self.assertEqual(str(note), "Shopping")
