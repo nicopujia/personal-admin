@@ -21,6 +21,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 include = [
   "/manage.py",
+  "/notepad",
   "/personal_admin",
   "/redirects",
 ]
@@ -28,6 +29,7 @@ include = [
 [tool.hatch.build.targets.sdist]
 include = [
   "/manage.py",
+  "/notepad",
   "/personal_admin",
   "/redirects",
   "/pyproject.toml",
@@ -56,6 +58,7 @@ typeCheckingMode = "standard"
 reportMissingTypeStubs = false
 include = [
     "manage.py",
+    "notepad",
     "personal_admin",
     "redirects",
 ]
