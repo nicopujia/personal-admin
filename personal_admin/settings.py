@@ -130,10 +130,13 @@ USE_TZ = True
 
 STATIC_URL = "/admin/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+MEDIA_URL = "/admin/notepad/files/"
+MEDIA_ROOT = BASE_DIR / "data" / "uploads"
 STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
-    }
+    },
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

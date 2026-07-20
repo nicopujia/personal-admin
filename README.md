@@ -7,7 +7,7 @@ Minimal personal admin dashboard for random stuff.
 ### Features
 
 - Redirects.
-- Notepad.
+- Notepad with file attachments.
 
 ## Prerequisites
 
